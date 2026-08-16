@@ -1,0 +1,77 @@
+name: Build and Deploy
+
+# Push to main -> build image, push to ECR (triggers EventBridge -> CodePipeline -> CodeDeploy blue/green).
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+# Required for OIDC (no long-lived AWS keys).
+permissions:
+  id-token: write
+  contents: read
+
+env:
+  AWS_REGION: ${{ vars.AWS_REGION || 'eu-central-1' }}
+  ECR_REPOSITORY: ${{ vars.ECR_REPOSITORY || 'photo-gallery' }}
+  CONFIG_BUCKET: ${{ vars.CONFIG_BUCKET }}      # e.g. photo-gallery-deploy-<acct>-<region>
+  TASK_FAMILY: ${{ vars.TASK_FAMILY || 'photo-gallery' }}
+  CONTAINER_NAME: app
+
+jobs:
+  build-and-deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Login to Amazon ECR
+        id: ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Build image
+        env:
+          REGISTRY: ${{ steps.ecr.outputs.registry }}
+        run: |
+          IMAGE_URI="$REGISTRY/${ECR_REPOSITORY}"
+          docker build -t "$IMAGE_URI:${GITHUB_SHA}" -t "$IMAGE_URI:latest" .
+          echo "IMAGE_URI=$IMAGE_URI" >> "$GITHUB_ENV"
+
+      # Render taskdef.json from the CloudFormation-created task definition so roles,
+      # env vars, secrets and log config always stay in sync with the infra stack.
+      - name: Render taskdef.json + appspec.yaml
+        run: |
+          aws ecs describe-task-definition \
+            --task-definition "${TASK_FAMILY}" \
+            --query 'taskDefinition' --output json > full-taskdef.json
+
+          # Strip fields that RegisterTaskDefinition rejects, and set the image placeholder.
+          jq 'del(.taskDefinitionArn, .revision, .status, .requiresAttributes,
+                  .compatibilities, .registeredAt, .registeredBy)
+              | (.containerDefinitions[] | select(.name=="'"${CONTAINER_NAME}"'") | .image) = "<IMAGE1_NAME>"' \
+            full-taskdef.json > taskdef.json
+
+          echo "----- taskdef.json -----"; cat taskdef.json
+          # appspec.yaml already lives in the repo root and is packaged as-is.
+
+      - name: Package and upload config.zip (appspec + taskdef)
+        run: |
+          zip -j config.zip taskdef.json appspec.yaml
+          aws s3 cp config.zip "s3://${CONFIG_BUCKET}/config/config.zip"
+
+      # Push LAST so the ECR EventBridge trigger fires only after config is in S3.
+      - name: Push image to ECR
+        run: |
+          docker push "${IMAGE_URI}:${GITHUB_SHA}"
+          docker push "${IMAGE_URI}:latest"
+
+      - name: Summary
+        run: |
+          echo "Pushed ${IMAGE_URI}:${GITHUB_SHA} and :latest" >> "$GITHUB_STEP_SUMMARY"
+          echo "EventBridge should now trigger CodePipeline -> CodeDeploy blue/green." >> "$GITHUB_STEP_SUMMARY"
