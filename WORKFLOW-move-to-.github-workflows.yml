@@ -52,9 +52,12 @@ jobs:
             --query 'taskDefinition' --output json > full-taskdef.json
 
           # Strip fields that RegisterTaskDefinition rejects, and set the image placeholder.
+          # Also drop the placeholder command/entryPoint so the real app image runs its
+          # own Dockerfile CMD (node server.js) instead of the python bootstrap server.
           jq 'del(.taskDefinitionArn, .revision, .status, .requiresAttributes,
                   .compatibilities, .registeredAt, .registeredBy)
-              | (.containerDefinitions[] | select(.name=="'"${CONTAINER_NAME}"'") | .image) = "<IMAGE1_NAME>"' \
+              | (.containerDefinitions[] | select(.name=="'"${CONTAINER_NAME}"'") | .image) = "<IMAGE1_NAME>"
+              | (.containerDefinitions[] |= del(.command, .entryPoint))' \
             full-taskdef.json > taskdef.json
 
           echo "----- taskdef.json -----"; cat taskdef.json
